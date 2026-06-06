@@ -1,0 +1,11 @@
+# Per-server profiles, their generated artifacts, backups, and active-profile state
+.env
+profiles/
+.active-profile
+
+# Generated artifacts (legacy / top-level)
+config.ign
+config.rendered.bu
+
+# SSH control sockets
+.ssh-*.sock
