@@ -90,6 +90,10 @@ CORE_USER="core"; NET_IFACE="auto"; RESCUE_USER="root"
 RESCUE_AUTH="password"      # how to log into OVH rescue: "password" or "key"
 RESCUE_KEY_PATH=""          # private key for rescue when RESCUE_AUTH=key (blank = default keys)
 STREAM="stable"            # Fedora CoreOS update stream: stable | testing | next (no LTS)
+# Day-2 server management state (persisted):
+SSH_PUBLIC="yes"           # "yes" = port 22 open to internet; "no" = Tailscale-only
+FW_CLOSED=""               # comma list of closed ports, e.g. "8080/tcp,53/udp"
+MGMT_HOST=""               # host coreos_ssh connects to (blank = TARGET_IP; set to Tailscale IP when SSH restricted)
 # In-memory only (never written anywhere): console password hash, rescue password.
 PASSWORD_HASH=""; RESCUE_PASSWORD=""
 
@@ -97,6 +101,7 @@ reset_settings() { # restore defaults before loading/creating a profile
   SSH_PUBKEY=""; SSH_KEY_PATH=""; TARGET_IP=""; FCOS_HOSTNAME=""
   CORE_USER="core"; NET_IFACE="auto"; RESCUE_USER="root"; PASSWORD_HASH=""
   RESCUE_AUTH="password"; RESCUE_KEY_PATH=""; STREAM="stable"
+  SSH_PUBLIC="yes"; FW_CLOSED=""; MGMT_HOST=""
 }
 
 sanitize_name() { local s="${1//[^A-Za-z0-9_.-]/-}"; s="${s##-}"; printf '%s' "${s:-default}"; }
@@ -151,6 +156,9 @@ RESCUE_USER=$(printf '%q' "$RESCUE_USER")
 RESCUE_AUTH=$(printf '%q' "$RESCUE_AUTH")
 RESCUE_KEY_PATH=$(printf '%q' "$RESCUE_KEY_PATH")
 STREAM=$(printf '%q' "$STREAM")
+SSH_PUBLIC=$(printf '%q' "$SSH_PUBLIC")
+FW_CLOSED=$(printf '%q' "$FW_CLOSED")
+MGMT_HOST=$(printf '%q' "$MGMT_HOST")
 EOF
   printf '%s' "$PROFILE" > "$STATE_FILE"
   ok "Saved profile '$PROFILE' → ${ENV_FILE/#$HOME/\~}  (previous version backed up)"
@@ -282,11 +290,13 @@ rescue_ssh_close() {
   ssh -O exit -o ControlPath="$SSH_CTRL" "${RESCUE_USER}@${TARGET_IP}" >/dev/null 2>&1 || true
 }
 
-coreos_ssh() { # ssh to core@coreos using the configured private key
+coreos_host() { printf '%s' "${MGMT_HOST:-$TARGET_IP}"; }  # Tailscale IP once SSH is restricted
+
+coreos_ssh() { # ssh to core@<coreos_host> using the configured private key
   local extra=()
   [[ -n "$SSH_KEY_PATH" ]] && extra=(-i "$SSH_KEY_PATH")
   ssh "${extra[@]}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
-      "${CORE_USER}@${TARGET_IP}" "$@"
+      "${CORE_USER}@$(coreos_host)" "$@"
 }
 
 wait_for_ssh() { # wait_for_ssh <label> <connect-fn-name>  -- polls until login works
@@ -898,6 +908,199 @@ REMOTE
 }
 
 # ===========================================================================
+# Server management (Day-2: acts on the live, running CoreOS box)
+# ===========================================================================
+require_live() {
+  [[ -n "$TARGET_IP" ]] || { err "No server configured (run the install first)."; return 1; }
+  coreos_ssh true 2>/dev/null || { err "Can't reach the server at $(coreos_host). Is it up and reachable?"; return 1; }
+}
+
+# Emit the nftables ruleset for the current SSH_PUBLIC + FW_CLOSED state.
+# Default-allow (FCOS default); only explicit drops. INPUT chain only — no FORWARD
+# chain, so Docker published ports and exit-node forwarding (FORWARD/DNAT) keep working.
+generate_nft_rules() {
+  local closed_tcp="" closed_udp="" p
+  local IFS=','
+  for p in $FW_CLOSED; do
+    [[ -z "$p" ]] && continue
+    case "$p" in
+      */udp) closed_udp+="${closed_udp:+, }${p%/udp}" ;;
+      *)     closed_tcp+="${closed_tcp:+, }${p%/tcp}" ;;
+    esac
+  done
+  unset IFS
+  printf '#!/usr/sbin/nft -f\n'
+  printf '# Managed by install-coreos wizard — default-allow, explicit drops only.\n'
+  printf 'table inet wizard {\n'
+  printf '  chain input {\n'
+  printf '    type filter hook input priority 0; policy accept;\n'
+  printf '    ct state established,related accept\n'
+  printf '    iif "lo" accept\n'
+  printf '    iifname "tailscale0" accept\n'          # tailnet is fully trusted
+  if [[ "$SSH_PUBLIC" != yes ]]; then
+    printf '    ip saddr 100.64.0.0/10 tcp dport 22 accept\n'
+    printf '    ip6 saddr fd7a:115c:a1e0::/48 tcp dport 22 accept\n'
+    printf '    tcp dport 22 drop\n'                  # block public SSH (tailnet already accepted above)
+  fi
+  [[ -n "$closed_tcp" ]] && printf '    tcp dport { %s } drop\n' "$closed_tcp"
+  [[ -n "$closed_udp" ]] && printf '    udp dport { %s } drop\n' "$closed_udp"
+  printf '  }\n}\n'
+}
+
+# Safely apply the ruleset: dry-run → arm dead-man rollback → apply+persist →
+# confirm via $2 (fresh connection) and cancel the timer. $1=description.
+fw_apply() {
+  local desc="$1" chost="${2:-$(coreos_host)}"
+  local rules b64; rules="$(generate_nft_rules)"; b64="$(printf '%s' "$rules" | base64 -w0)"
+
+  if ! coreos_ssh "echo $b64 | base64 -d | sudo nft -c -f -" 2>/dev/null; then
+    err "Generated nftables ruleset failed validation — nothing applied."; return 1
+  fi
+  # Dead-man: in 120s, drop our table → FCOS default (all open) → guaranteed reachable.
+  coreos_ssh "sudo systemd-run --collect --on-active=120 --unit=wizard-fw-rollback \
+      /usr/sbin/nft delete table inet wizard >/dev/null 2>&1; true" >/dev/null 2>&1 || true
+  info "Auto-rollback armed: if this locks you out, access is restored in ~120s."
+  # Apply + persist (survive reboot).
+  coreos_ssh "echo $b64 | base64 -d | sudo tee /etc/sysconfig/nftables.conf >/dev/null \
+      && sudo nft -f /etc/sysconfig/nftables.conf \
+      && sudo systemctl enable nftables.service >/dev/null 2>&1; true" || true
+  # Confirm + cancel the timer through $chost in ONE fresh connection.
+  local sshk=(); [[ -n "$SSH_KEY_PATH" ]] && sshk=(-i "$SSH_KEY_PATH")
+  if ssh "${sshk[@]}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=12 "${CORE_USER}@${chost}" \
+       "sudo systemctl stop wizard-fw-rollback.timer 2>/dev/null; sudo systemctl reset-failed wizard-fw-rollback.service 2>/dev/null; true" 2>/dev/null; then
+    ok "$desc — applied, persisted, confirmed via ${chost}."
+    return 0
+  fi
+  warn "$desc applied but could NOT confirm via ${chost} — auto-rollback will restore access (~120s)."
+  return 1
+}
+
+toggle_exit_node() {
+  require_live || return 1
+  info "Exit node lets other tailnet devices route their internet through this box."
+  if confirm "Enable exit node? (No = disable)" y; then
+    coreos_ssh "sudo tailscale set --advertise-exit-node" \
+      && ok "Advertising as exit node — approve it in the admin console (Machines → … → Edit route settings)." \
+      || err "tailscale set failed."
+  else
+    coreos_ssh "sudo tailscale set --advertise-exit-node=false" \
+      && ok "Exit node disabled." || err "tailscale set failed."
+  fi
+}
+
+toggle_public_ssh() {
+  require_live || return 1
+  local sshk=(); [[ -n "$SSH_KEY_PATH" ]] && sshk=(-i "$SSH_KEY_PATH")
+  if [[ "$SSH_PUBLIC" == yes ]]; then
+    banner "Restrict public SSH → Tailscale-only"
+    warn "This drops port 22 from the public internet (tailnet keeps working)."
+    local tsip
+    tsip="$(coreos_ssh 'tailscale ip -4 2>/dev/null' | tr -d '\r' | head -1)"
+    [[ "$tsip" =~ ^100\. ]] || { err "Couldn't read the box's Tailscale IP (is Tailscale up?). Aborting — no change."; return 1; }
+    info "Box Tailscale IP: $tsip. Verifying THIS machine can SSH it…"
+    if ! ssh "${sshk[@]}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=12 "${CORE_USER}@${tsip}" true 2>/dev/null; then
+      err "This machine CANNOT reach $tsip over Tailscale."
+      err "Get 'ssh ${CORE_USER}@${tsip}' working from here first (this machine must be on the tailnet)."
+      return 1
+    fi
+    ok "Confirmed: this machine reaches $tsip over Tailscale."
+    confirm "Restrict public SSH now? (auto-rollback protects you)" y || return 0
+    local old="$SSH_PUBLIC"; SSH_PUBLIC="no"
+    if fw_apply "Public SSH → Tailscale-only" "$tsip"; then
+      MGMT_HOST="$tsip"; save_env
+      ok "Public SSH restricted. The wizard now manages this box via $tsip."
+      info "Connect with:  tailscale ssh ${CORE_USER}@${FCOS_HOSTNAME}   (or ssh ${CORE_USER}@${tsip})"
+    else
+      SSH_PUBLIC="$old"
+      warn "Not confirmed — auto-rollback restores public SSH; state left as open."
+    fi
+  else
+    banner "Re-open public SSH"
+    confirm "Re-open port 22 to the internet?" n || return 0
+    local old="$SSH_PUBLIC"; SSH_PUBLIC="yes"
+    if fw_apply "Public SSH → open" "$(coreos_host)"; then
+      MGMT_HOST=""; save_env
+      ok "Public SSH re-opened. The wizard manages via $TARGET_IP again."
+    else
+      SSH_PUBLIC="$old"
+      warn "Could not confirm — left as Tailscale-only."
+    fi
+  fi
+}
+
+fw_list() {
+  require_live || return 1
+  banner "Firewall status — ${FCOS_HOSTNAME:-?}"
+  info "Public SSH : $([[ "$SSH_PUBLIC" == yes ]] && echo open || echo "Tailscale-only")"
+  info "Closed ports: ${FW_CLOSED:-none (all open — FCOS default)}"
+  echo "--- live nftables (managed table) ---"
+  coreos_ssh "sudo nft list table inet wizard 2>/dev/null || echo '(no managed table loaded — all ports open)'"
+}
+
+fw_close_port() {
+  require_live || return 1
+  local p; ask p "Port to CLOSE to the public (e.g. 8080 or 8080/udp)" ""
+  [[ -n "$p" ]] || return 0
+  [[ "$p" == */* ]] || p="$p/tcp"
+  [[ "$p" =~ ^[0-9]+/(tcp|udp)$ ]] || { err "Use PORT or PORT/tcp|udp."; return 1; }
+  [[ "${p%/*}" == 22 ]] && { err "Use the Public SSH toggle for port 22, not this."; return 1; }
+  case ",$FW_CLOSED," in *",$p,"*) info "$p is already closed."; return 0 ;; esac
+  local old="$FW_CLOSED"; FW_CLOSED="${FW_CLOSED:+$FW_CLOSED,}$p"
+  if fw_apply "Closed $p (public; tailnet still allowed)"; then save_env; else FW_CLOSED="$old"; fi
+}
+
+fw_open_port() {
+  require_live || return 1
+  [[ -n "$FW_CLOSED" ]] || { info "No ports are closed."; return 0; }
+  info "Currently closed: $FW_CLOSED"
+  local p; ask p "Port to RE-OPEN (e.g. 8080 or 8080/udp)" ""
+  [[ -n "$p" ]] || return 0
+  [[ "$p" == */* ]] || p="$p/tcp"
+  local old="$FW_CLOSED" new="" x; local IFS=','
+  for x in $FW_CLOSED; do [[ "$x" == "$p" ]] || new="${new:+$new,}$x"; done
+  unset IFS
+  [[ "$new" == "$old" ]] && { warn "$p was not in the closed list."; return 0; }
+  FW_CLOSED="$new"
+  if fw_apply "Opened $p"; then save_env; else FW_CLOSED="$old"; fi
+}
+
+fw_disable() {
+  require_live || return 1
+  confirm "Remove the managed firewall entirely (all ports open, SSH restriction lifted)?" n || return 0
+  coreos_ssh "sudo nft delete table inet wizard 2>/dev/null; sudo rm -f /etc/sysconfig/nftables.conf; \
+              sudo systemctl disable nftables.service 2>/dev/null; true" || true
+  FW_CLOSED=""; SSH_PUBLIC="yes"; MGMT_HOST=""; save_env
+  ok "Managed firewall removed — back to FCOS default (all open). Wizard uses $TARGET_IP."
+}
+
+server_management_menu() {
+  while true; do
+    banner "Server management — ${FCOS_HOSTNAME:-?} @ $(coreos_host)"
+    info "Operates on the live, running server."
+    printf '\n  %sTailscale%s\n' "$C_BOLD" "$C_RESET"
+    printf '    %se%s) Exit node           enable / disable\n' "$C_BOLD" "$C_RESET"
+    printf '  %sAccess%s\n' "$C_BOLD" "$C_RESET"
+    printf '    %sx%s) Public SSH          currently: %s%s%s\n' "$C_BOLD" "$C_RESET" \
+      "$([[ "$SSH_PUBLIC" == yes ]] && printf "%sopen%s" "$C_YELLOW" "$C_RESET" || printf "%sTailscale-only%s" "$C_GREEN" "$C_RESET")" "" ""
+    printf '  %sFirewall (nftables)%s\n' "$C_BOLD" "$C_RESET"
+    printf '    %sl%s) List / status      %sc%s) Close a port   %so%s) Open a port   %sd%s) Disable\n' \
+      "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+    printf '\n  %sb%s) Back\n' "$C_BOLD" "$C_RESET"
+    local k; ask k "Choose" ""
+    case "$k" in
+      e) toggle_exit_node || true ;;
+      x) toggle_public_ssh || true ;;
+      l) fw_list || true ;;
+      c) fw_close_port || true ;;
+      o) fw_open_port || true ;;
+      d) fw_disable || true ;;
+      b|"") return 0 ;;
+      *) warn "Unknown choice: $k" ;;
+    esac
+  done
+}
+
+# ===========================================================================
 # Profiles UI
 # ===========================================================================
 new_profile() { # create + switch to a new profile, then configure it
@@ -1030,6 +1233,9 @@ main_menu() {
     ${C_BOLD}4${C_RESET}) Layer & reboot     coreos: docker-ce + tailscale
     ${C_BOLD}5${C_RESET}) Finalize           coreos: enable + tailscale up + GRO
 
+  ${C_BOLD}Server management${C_RESET}  (live box)
+    ${C_BOLD}m${C_RESET}) Manage             exit node · public SSH · firewall
+
   ${C_BOLD}a${C_RESET}) Run 2→5 in order     ${C_BOLD}L${C_RESET}) View log     ${C_BOLD}q${C_RESET}) Quit
 EOF
     local choice
@@ -1038,6 +1244,7 @@ EOF
     # set -e killing the wizard). A hard 'die' inside a step still exits.
     case "$choice" in
       l|L) view_log || true ;;
+      m|M) server_management_menu || true ;;
       p|P) profiles_menu || true ;;
       1) step_configure || true ;;
       2) step_build_ignition || true ;;

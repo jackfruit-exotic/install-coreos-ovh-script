@@ -64,6 +64,26 @@ lost when you edit. Generated `config.ign` is per-profile too (`profiles/<name>.
 > A legacy top-level `.env` from an earlier version is auto-migrated to
 > `profiles/default.env` on first launch.
 
+### Server management (main menu option `m`)
+
+Day-2 operations against the **live, running** server:
+
+- **Exit node** — enable/disable (`tailscale set --advertise-exit-node`). Still
+  needs one-time approval in the Tailscale admin console.
+- **Public SSH** — restrict port 22 to the **Tailscale network only** (or re-open
+  it). FCOS ships no firewall, so this uses **nftables**. **Lockout-safe:** before
+  restricting, the wizard reads the box's Tailscale IP and verifies *this machine*
+  can SSH it; every change is applied behind a **dead-man's-timer auto-rollback**
+  (`systemd-run … nft delete table inet wizard` in ~120 s) that restores access if
+  a rule locks you out, and is cancelled only after a fresh connection confirms
+  you're still in. Once restricted, the profile manages the box over Tailscale.
+- **Firewall** (nftables, default-allow) — list status, **close**/**re-open**
+  individual ports (closed = blocked from the public internet; the tailnet stays
+  allowed), or **disable** the managed firewall (back to FCOS all-open). The
+  ruleset is a single `inet wizard` table with an **input chain only**, so Docker
+  published ports and exit-node forwarding (FORWARD/DNAT traffic) keep working. It
+  is persisted to `/etc/sysconfig/nftables.conf` + `systemctl enable nftables`.
+
 ### Settings menu (option `1`)
 
 All non-secret params persist to `.env` (gitignored) so you only enter them

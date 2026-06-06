@@ -9,3 +9,7 @@ config.rendered.bu
 
 # SSH control sockets
 .ssh-*.sock
+
+# Local Claude context (not for the repo)
+CLAUDE.md
+.claude/
