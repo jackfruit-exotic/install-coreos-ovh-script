@@ -904,7 +904,27 @@ REMOTE
   echo
   log "STEP5 finalize complete"
   ok "Done. The node should now be visible in your Tailscale admin console."
-  info "Log in any time with:  ssh -i ${SSH_KEY_PATH:-<key>} ${CORE_USER}@${TARGET_IP}"
+
+  # Host-key reminder: the reinstall changed the box's SSH host key, so any name
+  # you connect by needs its stale local entry cleared (otherwise you hit
+  # "REMOTE HOST IDENTIFICATION HAS CHANGED"). Step 4 cleared TARGET_IP; here we
+  # also handle the hostname and the Tailscale IP, and print the commands.
+  local tsip
+  tsip="$(coreos_ssh 'tailscale ip -4 2>/dev/null' | tr -d '\r' | head -1)"
+  banner "Host-key reminder (server was reinstalled → its SSH key changed)"
+  info "Clearing stale local host keys so you can reconnect without warnings:"
+  clear_known_host "$TARGET_IP"
+  [[ -n "$FCOS_HOSTNAME" ]] && clear_known_host "$FCOS_HOSTNAME"
+  [[ -n "$tsip" ]]          && clear_known_host "$tsip"
+  echo
+  info "If you connect from another machine, run there too:"
+  info "  ssh-keygen -R ${TARGET_IP}"
+  [[ -n "$FCOS_HOSTNAME" ]] && info "  ssh-keygen -R ${FCOS_HOSTNAME}"
+  [[ -n "$tsip" ]]          && info "  ssh-keygen -R ${tsip}"
+  echo
+  info "Then log in with either:"
+  info "  tailscale ssh ${CORE_USER}@${FCOS_HOSTNAME}            # via Tailscale (no key needed)"
+  info "  ssh -i ${SSH_KEY_PATH:-<key>} ${CORE_USER}@${TARGET_IP}   # via public IP + your key"
 }
 
 # ===========================================================================
