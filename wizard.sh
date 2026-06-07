@@ -90,6 +90,11 @@ CORE_USER="core"; NET_IFACE="auto"; RESCUE_USER="root"
 RESCUE_AUTH="password"      # how to log into OVH rescue: "password" or "key"
 RESCUE_KEY_PATH=""          # private key for rescue when RESCUE_AUTH=key (blank = default keys)
 STREAM="stable"            # Fedora CoreOS update stream: stable | testing | next (no LTS)
+# Disk plan (set by step 2 "Inspect & plan"; persisted):
+DISK_LAYOUT="single"       # single | raid1 | raid0
+INSTALL_DISK=""            # by-id path of the disk coreos-installer writes to (blank = ask in step 4)
+RAID_DISKS=""              # by-id csv of the 2 disks for raid0/raid1
+DISK_PLAN=""               # human-readable summary for display
 # Day-2 server management state (persisted):
 SSH_PUBLIC="yes"           # "yes" = port 22 open to internet; "no" = Tailscale-only
 FW_CLOSED=""               # comma list of closed ports, e.g. "8080/tcp,53/udp"
@@ -101,6 +106,7 @@ reset_settings() { # restore defaults before loading/creating a profile
   SSH_PUBKEY=""; SSH_KEY_PATH=""; TARGET_IP=""; FCOS_HOSTNAME=""
   CORE_USER="core"; NET_IFACE="auto"; RESCUE_USER="root"; PASSWORD_HASH=""
   RESCUE_AUTH="password"; RESCUE_KEY_PATH=""; STREAM="stable"
+  DISK_LAYOUT="single"; INSTALL_DISK=""; RAID_DISKS=""; DISK_PLAN=""
   SSH_PUBLIC="yes"; FW_CLOSED=""; MGMT_HOST=""
 }
 
@@ -156,6 +162,10 @@ RESCUE_USER=$(printf '%q' "$RESCUE_USER")
 RESCUE_AUTH=$(printf '%q' "$RESCUE_AUTH")
 RESCUE_KEY_PATH=$(printf '%q' "$RESCUE_KEY_PATH")
 STREAM=$(printf '%q' "$STREAM")
+DISK_LAYOUT=$(printf '%q' "$DISK_LAYOUT")
+INSTALL_DISK=$(printf '%q' "$INSTALL_DISK")
+RAID_DISKS=$(printf '%q' "$RAID_DISKS")
+DISK_PLAN=$(printf '%q' "$DISK_PLAN")
 SSH_PUBLIC=$(printf '%q' "$SSH_PUBLIC")
 FW_CLOSED=$(printf '%q' "$FW_CLOSED")
 MGMT_HOST=$(printf '%q' "$MGMT_HOST")
@@ -414,7 +424,7 @@ edit_rescue() { # OVH rescue access: user + auth method (password or SSH key)
          RESCUE_KEY_PATH="$p"
        fi ;;
     *) RESCUE_AUTH="password"; RESCUE_KEY_PATH=""
-       ok "Rescue auth: password (you'll be prompted in step 3)." ;;
+       ok "Rescue auth: password (you'll be prompted in step 4)." ;;
   esac
 }
 
@@ -470,7 +480,7 @@ step_configure() {
       "$C_BOLD" "$C_RESET" "$(shorty "${STREAM:-stable}")" "$C_DIM" "$C_RESET"
 
     if [[ -n "$TARGET_IP" && -n "$FCOS_HOSTNAME" && -n "$SSH_PUBKEY" ]]; then
-      printf '\n  %s✓ ready to build the Ignition (step 2)%s\n' "$C_GREEN" "$C_RESET"
+      printf '\n  %s✓ ready to build the Ignition (step 3)%s\n' "$C_GREEN" "$C_RESET"
     else
       printf '\n  %sfill the ⚠ required fields above to continue%s\n' "$C_YELLOW" "$C_RESET"
     fi
@@ -483,7 +493,7 @@ step_configure() {
       1) ask TARGET_IP     "Server public IPv4 (OVH manager → your server)" "$TARGET_IP" ;;
       2) ask FCOS_HOSTNAME "Hostname for the new server"      "${FCOS_HOSTNAME:-coreos-host}" ;;
       3) ask CORE_USER     "CoreOS admin username (SSH login)" "${CORE_USER:-core}" ;;
-      4) info "Leave as 'auto' — the wizard detects the real NIC on the server in step 5."
+      4) info "Leave as 'auto' — the wizard detects the real NIC on the server in step 6."
          info "Only set a name (e.g. ens3, eth0, eno1) if you want to force one."
          ask NET_IFACE     "Network interface"                "${NET_IFACE:-auto}" ;;
       5) edit_rescue ;;
@@ -507,7 +517,7 @@ ${C_BOLD}What each setting means${C_RESET}
   ${C_BOLD}1 Server IP${C_RESET}        The public IPv4 of your server, shown in the OVH manager.
   ${C_BOLD}2 Hostname${C_RESET}         The name your new CoreOS box will have (and its Tailscale name).
   ${C_BOLD}3 Admin user${C_RESET}       The Linux user created for you (SSH-key login). 'core' is standard.
-  ${C_BOLD}4 Interface${C_RESET}        Leave 'auto'. Detected on the server (e.g. ens3/eth0) in step 5.
+  ${C_BOLD}4 Interface${C_RESET}        Leave 'auto'. Detected on the server (e.g. ens3/eth0) in step 6.
   ${C_BOLD}5 Rescue access${C_RESET}    OVH rescue login (user, almost always 'root') and ${C_BOLD}how${C_RESET} to
                     authenticate: ${C_BOLD}password${C_RESET} (OVH emails a fresh one each time you
                     enable rescue) or ${C_BOLD}SSH key${C_RESET} (one you registered in OVH's rescue
@@ -525,7 +535,96 @@ EOF
 }
 
 # ===========================================================================
-# STEP 2 — Build Ignition
+# STEP 2 — Inspect server & plan disks (rescue)
+# ===========================================================================
+human_size() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || printf '%s' "${1:-?}"; }
+
+step_inspect() {
+  banner "Step 2 — Inspect server & plan disks (rescue)"
+  require_config || return 1
+  warn "Connects to ${RESCUE_USER}@${TARGET_IP} (OVH rescue) to read the hardware."
+  info "Boot the server into RESCUE mode in the OVH manager first."
+  confirm "Continue?" || return 0
+  [[ "$RESCUE_AUTH" == password ]] && prompt_rescue_password
+  clear_known_host "$TARGET_IP"
+
+  info "Reading disks from the rescue box…"
+  local raw
+  raw="$(rescue_ssh '
+    for d in $(lsblk -dn -o NAME,TYPE | awk "\$2==\"disk\"{print \$1}"); do
+      size=$(lsblk -dnb -o SIZE "/dev/$d" 2>/dev/null)
+      model=$(lsblk -dn -o MODEL "/dev/$d" 2>/dev/null | sed "s/[[:space:]]*$//")
+      byid=""
+      for l in $(udevadm info -q symlink -n "/dev/$d" 2>/dev/null); do
+        case "$l" in disk/by-id/*) byid="/dev/$l"; break;; esac
+      done
+      printf "%s|%s|%s|%s\n" "$d" "$size" "$model" "$byid"
+    done')" || { rescue_ssh_close; err "Could not reach the rescue box (check IP / rescue mode / credentials)."; return 1; }
+  rescue_ssh_close
+  raw="$(printf '%s' "$raw" | tr -d '\r')"
+  [[ -n "$raw" ]] || { err "No disks detected on the server."; return 1; }
+
+  local names=() sizes=() models=() byids=() n s m b
+  while IFS='|' read -r n s m b; do
+    [[ -n "$n" ]] || continue
+    names+=("$n"); sizes+=("$s"); models+=("$m"); byids+=("$b")
+  done <<< "$raw"
+  local N=${#names[@]} i
+  echo; info "Disks detected:"
+  for i in "${!names[@]}"; do
+    printf '  %s%d%s) %-10s %9s  %s\n' "$C_BOLD" $((i+1)) "$C_RESET" \
+      "${names[$i]}" "$(human_size "${sizes[$i]}")" "${models[$i]:-?}"
+  done
+  echo
+
+  info "Install layout:"
+  info "  1) Single disk    — one disk, no redundancy"
+  if (( N >= 2 )); then
+    info "  2) RAID1 mirror   — survives one disk failure  ${C_GREEN}(recommended)${C_RESET}"
+    info "  3) RAID0 stripe   — max space/speed; ${C_RED}NO redundancy, experimental on FCOS${C_RESET}"
+  fi
+  local choice; ask choice "Choose" "$([[ $N -ge 2 ]] && echo 2 || echo 1)"
+
+  local a=-1 bi=-1 x y
+  case "$choice" in
+    2|3)
+      (( N >= 2 )) || { err "Need at least 2 disks for RAID."; return 1; }
+      if (( N == 2 )); then a=0; bi=1; else
+        ask x "First disk #" ""; ask y "Second disk #" ""
+        [[ "$x" =~ ^[0-9]+$ && "$y" =~ ^[0-9]+$ ]] && (( x>=1 && x<=N && y>=1 && y<=N && x!=y )) \
+          || { err "Invalid disk selection."; return 1; }
+        a=$((x-1)); bi=$((y-1))
+      fi
+      local dev_a="${byids[$a]:-/dev/${names[$a]}}" dev_b="${byids[$bi]:-/dev/${names[$bi]}}"
+      INSTALL_DISK="$dev_a"; RAID_DISKS="$dev_a,$dev_b"
+      if [[ "$choice" == 2 ]]; then
+        DISK_LAYOUT="raid1"; DISK_PLAN="RAID1 mirror: ${names[$a]} + ${names[$bi]}"
+        ok "$DISK_PLAN — either disk can fail without data loss."
+      else
+        DISK_LAYOUT="raid0"; DISK_PLAN="RAID0 stripe: ${names[$a]} + ${names[$bi]}"
+        warn "$DISK_PLAN — NO redundancy; either disk failing destroys everything."
+        warn "RAID0 root is experimental on FCOS — verify the box boots after install."
+      fi
+      ;;
+    *)
+      if (( N == 1 )); then a=0; else
+        ask x "Disk to install on #" ""
+        [[ "$x" =~ ^[0-9]+$ ]] && (( x>=1 && x<=N )) || { err "Invalid selection."; return 1; }
+        a=$((x-1))
+      fi
+      DISK_LAYOUT="single"; INSTALL_DISK="${byids[$a]:-/dev/${names[$a]}}"; RAID_DISKS=""
+      DISK_PLAN="single: ${names[$a]}"
+      ok "$DISK_PLAN"
+      ;;
+  esac
+  info "Install target: $INSTALL_DISK"
+  [[ -n "$RAID_DISKS" ]] && warn "Both disks in the array will be ERASED at install time."
+  save_env
+  ok "Plan saved. Next: step 3 (Build Ignition) → step 4 (Install)."
+}
+
+# ===========================================================================
+# STEP 3 — Build Ignition
 # ===========================================================================
 render_butane() {
   # Optional console/maintenance password — applied to the admin user AND root
@@ -535,9 +634,16 @@ render_butane() {
     pw_user=$'\n      password_hash: "'"$PASSWORD_HASH"$'"'
     root_block=$'\n    - name: root\n      password_hash: "'"$PASSWORD_HASH"$'"'
   fi
-  cat > "$BU_FILE" <<EOF
-variant: fcos
-version: 1.5.0
+  local d1 d2; IFS=',' read -r d1 d2 <<< "$RAID_DISKS"
+
+  {
+    echo "variant: fcos"
+    echo "version: 1.5.0"
+    # RAID1: boot_device.mirror is the supported way to mirror /boot+ESP+root.
+    if [[ "$DISK_LAYOUT" == raid1 ]]; then
+      printf 'boot_device:\n  layout: x86_64\n  mirror:\n    devices:\n      - %s\n      - %s\n' "$d1" "$d2"
+    fi
+    cat <<EOF
 passwd:
   users:
     - name: ${CORE_USER}
@@ -546,6 +652,36 @@ passwd:
       ssh_authorized_keys:
         - "${SSH_PUBKEY}"${pw_user}${root_block}
 storage:
+EOF
+    # RAID0: hand-built layout — ESP+/boot on disk 1, root striped across both.
+    # (No redundancy; coreos-installer re-provisions root onto the array.)
+    if [[ "$DISK_LAYOUT" == raid0 ]]; then
+      cat <<EOF
+  disks:
+    - device: ${d1}
+      wipe_table: true
+      partitions:
+        - { label: bios-1, size_mib: 1, type_guid: 21686148-6449-6E6F-744E-656564454649 }
+        - { label: esp-1,  size_mib: 127, type_guid: C12A7328-F81F-11D2-BA4B-00A0C93EC93B }
+        - { label: boot-1, size_mib: 384 }
+        - { label: root-1 }
+    - device: ${d2}
+      wipe_table: true
+      partitions:
+        - { label: root-2 }
+  raid:
+    - name: root
+      level: raid0
+      devices:
+        - /dev/disk/by-partlabel/root-1
+        - /dev/disk/by-partlabel/root-2
+  filesystems:
+    - { device: /dev/disk/by-partlabel/esp-1,  format: vfat, label: EFI-SYSTEM, wipe_filesystem: true }
+    - { device: /dev/disk/by-partlabel/boot-1, format: ext4, label: boot,       wipe_filesystem: true }
+    - { device: /dev/md/root, format: xfs, label: root, wipe_filesystem: true }
+EOF
+    fi
+    cat <<EOF
   files:
     - path: /etc/hostname
       mode: 0644
@@ -564,6 +700,7 @@ storage:
           net.ipv4.ip_forward = 1
           net.ipv6.conf.all.forwarding = 1
 EOF
+  } > "$BU_FILE"
 }
 
 # Name the available Butane engine, preferring the native binary (no containers,
@@ -585,7 +722,7 @@ run_butane() { # stdin: .bu  ->  stdout: .ign
 }
 
 step_build_ignition() {
-  banner "Step 2 — Build Ignition config (local)"
+  banner "Step 3 — Build Ignition config (local)"
   require_config
 
   local engine; engine="$(butane_engine)"
@@ -629,12 +766,12 @@ step_build_ignition() {
 }
 
 # ===========================================================================
-# STEP 3 — Install to the rescue box
+# STEP 4 — Install to the rescue box
 # ===========================================================================
 step_rescue_install() {
-  banner "Step 3 — Install CoreOS on the rescue box"
-  require_config
-  [[ -f "$IGN_FILE" ]] || { err "No Ignition built yet — run step 2 first."; return 1; }
+  banner "Step 4 — Install CoreOS on the rescue box"
+  require_config || return 1
+  [[ -f "$IGN_FILE" ]] || { err "No Ignition built yet — run step 3 first."; return 1; }
 
   warn "This connects to ${RESCUE_USER}@${TARGET_IP} (the OVH rescue system)."
   info "First, in the OVH manager: reboot the server in RESCUE mode."
@@ -649,32 +786,45 @@ step_rescue_install() {
   [[ "$RESCUE_AUTH" == password ]] && prompt_rescue_password   # masked, session-only
   clear_known_host "$TARGET_IP"   # rescue host key differs from old OS / CoreOS
 
-  banner "Detecting disks on the rescue box"
-  info "Listing block devices — identify the persistent SSD by its size,"
-  info "NOT the small RAM-backed rescue root (sda is often the ramdisk on OVH)."
-  echo
-  rescue_ssh "lsblk -dno NAME,SIZE,MODEL,TYPE | sed 's/^/    /'" \
-    || { rescue_ssh_close; err "Could not reach the rescue box (check IP / rescue mode / credentials)."; return 1; }
-  echo
-
-  local device confirm_dev
-  ask device "Target disk to ERASE and install onto (e.g. sdb, nvme0n1)" ""
-  [[ -n "$device" ]] || { rescue_ssh_close; err "No device given — aborting."; return 1; }
-  device="${device#/dev/}"
-
-  printf '%s' "${C_RED}${C_BOLD}"
-  printf 'EVERYTHING on /dev/%s will be DESTROYED.%s\n' "$device" "$C_RESET"
-  ask confirm_dev "Re-type the device name to confirm" ""
-  [[ "$confirm_dev" == "$device" ]] || { rescue_ssh_close; err "Names didn't match — aborting (no changes made)."; return 1; }
+  local devpath
+  if [[ -n "$INSTALL_DISK" ]]; then
+    banner "Disk plan (from step 2: Inspect)"
+    info "Layout : ${DISK_PLAN:-$DISK_LAYOUT}"
+    info "Target : $INSTALL_DISK"
+    if [[ -n "$RAID_DISKS" ]]; then
+      printf '%s%sBoth disks in the %s array will be ERASED.%s\n' "$C_RED" "$C_BOLD" "$DISK_LAYOUT" "$C_RESET"
+    else
+      printf '%s%sEVERYTHING on %s will be DESTROYED.%s\n' "$C_RED" "$C_BOLD" "$INSTALL_DISK" "$C_RESET"
+    fi
+    devpath="$INSTALL_DISK"
+    local ans; ask ans "Type ERASE to confirm and install" ""
+    [[ "$ans" == "ERASE" ]] || { rescue_ssh_close; err "Not confirmed — aborting (no changes made)."; return 1; }
+  else
+    warn "No disk plan found — run step 2 (Inspect) for RAID options. Falling back to manual select."
+    banner "Detecting disks on the rescue box"
+    info "Identify the persistent SSD by size — NOT the small RAM-backed rescue root."
+    echo
+    rescue_ssh "lsblk -dno NAME,SIZE,MODEL,TYPE | sed 's/^/    /'" \
+      || { rescue_ssh_close; err "Could not reach the rescue box (check IP / rescue mode / credentials)."; return 1; }
+    echo
+    local device confirm_dev
+    ask device "Target disk to ERASE and install onto (e.g. sdb, nvme0n1)" ""
+    [[ -n "$device" ]] || { rescue_ssh_close; err "No device given — aborting."; return 1; }
+    device="${device#/dev/}"
+    printf '%s%sEVERYTHING on /dev/%s will be DESTROYED.%s\n' "$C_RED" "$C_BOLD" "$device" "$C_RESET"
+    ask confirm_dev "Re-type the device name to confirm" ""
+    [[ "$confirm_dev" == "$device" ]] || { rescue_ssh_close; err "Names didn't match — aborting (no changes made)."; return 1; }
+    devpath="/dev/$device"
+  fi
 
   local ign_b64
   ign_b64="$(base64 -w0 < "$IGN_FILE")"
 
   banner "Running coreos-installer (this downloads ~1GB and writes the disk)"
-  log "STEP3 install start: device=/dev/$device profile=$PROFILE ip=$TARGET_IP"
+  log "STEP4 install start: target=$devpath layout=$DISK_LAYOUT profile=$PROFILE ip=$TARGET_IP"
   # Pass device + base64 ignition as env so the remote script stays static & quote-safe.
   # All remote output is tee'd to the profile log for later debugging.
-  if rescue_ssh "DEV='$device' IGN_B64='$ign_b64' STREAM='${STREAM:-stable}' bash -s" <<'REMOTE' 2>&1 | tee -a "$LOG_FILE"
+  if rescue_ssh "DEV='$devpath' IGN_B64='$ign_b64' STREAM='${STREAM:-stable}' bash -s" <<'REMOTE' 2>&1 | tee -a "$LOG_FILE"
 set -euo pipefail
 
 # OVH rescue runs from a RAM-backed root, which makes containers fail at every
@@ -715,10 +865,10 @@ mount --bind /proc     "$ROOTFS/proc"
 mount --bind /sys      "$ROOTFS/sys"
 mount --bind /run/udev "$ROOTFS/run/udev" 2>/dev/null || true
 
-echo ">> Installing Fedora CoreOS (${STREAM:-stable} stream) onto /dev/$DEV via chroot…"
+echo ">> Installing Fedora CoreOS (${STREAM:-stable} stream) onto $DEV via chroot…"
 set +e
 chroot "$ROOTFS" /usr/bin/env PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-  coreos-installer install "/dev/$DEV" --stream "${STREAM:-stable}" -i /config.ign
+  coreos-installer install "$DEV" --stream "${STREAM:-stable}" -i /config.ign
 RC=$?
 set -e
 
@@ -739,28 +889,28 @@ REMOTE
 
   rescue_ssh_close
   RESCUE_PASSWORD=""              # drop the session password from memory
-  log "STEP3 install complete: /dev/$device"
+  log "STEP4 install complete: $devpath ($DISK_LAYOUT)"
   echo
-  ok "CoreOS written to /dev/$device."
+  ok "CoreOS written ($DISK_PLAN)."
   echo
   warn "Now, in the OVH manager:"
   info "  1. Switch boot mode back to ${C_BOLD}Boot from hard disk${C_RESET}."
   info "  2. Reboot the server."
-  info "  3. Then run step 4 here."
+  info "  3. Then run step 5 here."
 }
 
 # ===========================================================================
-# STEP 4 — Layer Docker + Tailscale on CoreOS (phase A)
+# STEP 5 — Layer Docker + Tailscale on CoreOS (phase A)
 # ===========================================================================
 step_coreos_layer() {
-  banner "Step 4 — Layer Docker + Tailscale (CoreOS, first reboot)"
+  banner "Step 5 — Layer Docker + Tailscale (CoreOS, first reboot)"
   require_config
   clear_known_host "$TARGET_IP"   # host identity changed: rescue/old OS -> CoreOS
   wait_for_ssh "CoreOS ($CORE_USER@)" coreos_ssh
 
   info "Checking what's already installed…"
   if coreos_ssh "rpm -q docker-ce >/dev/null 2>&1 && rpm -q tailscale >/dev/null 2>&1"; then
-    ok "docker-ce and tailscale are already layered — skip to step 5."
+    ok "docker-ce and tailscale are already layered — skip to step 6."
     return 0
   fi
 
@@ -802,22 +952,22 @@ REMOTE
     coreos_ssh "sudo systemctl reboot" || true
     sleep 5
     wait_for_ssh "CoreOS ($CORE_USER@)" coreos_ssh
-    ok "Back online — run step 5 to finalize."
+    ok "Back online — run step 6 to finalize."
   else
-    warn "Reboot manually (ssh ${CORE_USER}@${TARGET_IP} 'sudo systemctl reboot'), then run step 5."
+    warn "Reboot manually (ssh ${CORE_USER}@${TARGET_IP} 'sudo systemctl reboot'), then run step 6."
   fi
 }
 
 # ===========================================================================
-# STEP 5 — Finalize: enable services, Tailscale up, GRO (phase B)
+# STEP 6 — Finalize: enable services, Tailscale up, GRO (phase B)
 # ===========================================================================
 step_coreos_finalize() {
-  banner "Step 5 — Finalize (enable Docker/Tailscale, bring up tailnet)"
+  banner "Step 6 — Finalize (enable Docker/Tailscale, bring up tailnet)"
   require_config
   wait_for_ssh "CoreOS ($CORE_USER@)" coreos_ssh
 
   if ! coreos_ssh "command -v tailscale >/dev/null && rpm -q docker-ce >/dev/null 2>&1"; then
-    err "docker-ce/tailscale not active yet. Did you run step 4 AND reboot?"; return 1
+    err "docker-ce/tailscale not active yet. Did you run step 5 AND reboot?"; return 1
   fi
 
   # Resolve the network interface on the server unless the user forced a name.
@@ -1235,6 +1385,7 @@ status_line() {
   printf '  %sProfile:%s %s   %sConfig:%s %s   %sIgnition:%s %s\n' \
     "$C_DIM" "$C_RESET" "${C_BOLD}${PROFILE}${C_RESET}" \
     "$C_DIM" "$C_RESET" "$cfg" "$C_DIM" "$C_RESET" "$ign"
+  printf '  %sDisk plan:%s %s\n' "$C_DIM" "$C_RESET" "${DISK_PLAN:-not planned (run step 2)}"
 }
 
 main_menu() {
@@ -1248,15 +1399,16 @@ main_menu() {
     ${C_BOLD}1${C_RESET}) Configure / edit settings   (IP, hostname, keys, rescue user…)
 
   ${C_BOLD}Install steps${C_RESET}  (run in order; resume after each reboot)
-    ${C_BOLD}2${C_RESET}) Build Ignition     local:  Butane → config.ign
-    ${C_BOLD}3${C_RESET}) Install to disk    rescue: coreos-installer  (${RESCUE_USER}@, password or key)
-    ${C_BOLD}4${C_RESET}) Layer & reboot     coreos: docker-ce + tailscale
-    ${C_BOLD}5${C_RESET}) Finalize           coreos: enable + tailscale up + GRO
+    ${C_BOLD}2${C_RESET}) Inspect & plan     rescue: detect disks, choose RAID/single
+    ${C_BOLD}3${C_RESET}) Build Ignition     local:  Butane → config.ign
+    ${C_BOLD}4${C_RESET}) Install to disk    rescue: coreos-installer  (${RESCUE_USER}@, password or key)
+    ${C_BOLD}5${C_RESET}) Layer & reboot     coreos: docker-ce + tailscale
+    ${C_BOLD}6${C_RESET}) Finalize           coreos: enable + tailscale up + GRO
 
   ${C_BOLD}Server management${C_RESET}  (live box)
     ${C_BOLD}m${C_RESET}) Manage             exit node · public SSH · firewall
 
-  ${C_BOLD}a${C_RESET}) Run 2→5 in order     ${C_BOLD}L${C_RESET}) View log     ${C_BOLD}q${C_RESET}) Quit
+  ${C_BOLD}a${C_RESET}) Run 2→6 in order     ${C_BOLD}L${C_RESET}) View log     ${C_BOLD}q${C_RESET}) Quit
 EOF
     local choice
     ask choice "Choose" ""
@@ -1267,11 +1419,12 @@ EOF
       m|M) server_management_menu || true ;;
       p|P) profiles_menu || true ;;
       1) step_configure || true ;;
-      2) step_build_ignition || true ;;
-      3) step_rescue_install || true ;;
-      4) step_coreos_layer || true ;;
-      5) step_coreos_finalize || true ;;
-      a) if step_build_ignition && step_rescue_install; then
+      2) step_inspect || true ;;
+      3) step_build_ignition || true ;;
+      4) step_rescue_install || true ;;
+      5) step_coreos_layer || true ;;
+      6) step_coreos_finalize || true ;;
+      a) if step_inspect && step_build_ignition && step_rescue_install; then
            warn "Now switch OVH to 'boot from hard disk' and reboot the server."
            if confirm "Server rebooted into CoreOS — continue?"; then
              step_coreos_layer && step_coreos_finalize || true

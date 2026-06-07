@@ -16,12 +16,28 @@ three environments across two reboots, and each is a menu step you can resume:
 
 ```
  [local]  1. Configure        collect SSH key, IP, hostname, stream  -> profile
- [local]  2. Build Ignition   Butane -> config.ign  (native butane/podman/docker)
- [rescue] 3. Install to disk   coreos-installer writes CoreOS to the SSD
+ [rescue] 2. Inspect & plan   probe disks, choose layout: single / RAID1 / RAID0
+ [local]  3. Build Ignition   Butane -> config.ign  (native butane/podman/docker)
+ [rescue] 4. Install to disk   coreos-installer writes CoreOS (per the disk plan)
    ↳ switch OVH to "boot from hard disk" + reboot
- [coreos] 4. Layer & reboot    rpm-ostree: docker-ce + tailscale (one transaction)
- [coreos] 5. Finalize          enable services, `tailscale up`, UDP-GRO tuning
+ [coreos] 5. Layer & reboot    rpm-ostree: docker-ce + tailscale (one transaction)
+ [coreos] 6. Finalize          enable services, `tailscale up`, UDP-GRO tuning
 ```
+
+### Disk layout (step 2)
+
+Step 2 connects to the rescue box, lists the real disks, and asks how to lay them
+out — so RAID is offered based on the hardware actually present:
+
+- **Single** — one disk, no redundancy.
+- **RAID1 mirror** *(recommended for 2 disks)* — `boot_device.mirror`; mirrors
+  /boot + ESP + root, survives one disk failure.
+- **RAID0 stripe** — max space/speed but **no redundancy** (any disk failure =
+  total loss). RAID0-of-root is **non-standard on FCOS** (hand-built layout);
+  treat it as experimental and verify the box boots after install.
+
+The choice is saved in the profile (`DISK_LAYOUT`/`INSTALL_DISK`/`RAID_DISKS`) and
+baked into the Butane in step 3. Disk paths use stable `/dev/disk/by-id/` links.
 
 ## Requirements (local machine)
 
