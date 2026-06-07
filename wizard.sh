@@ -228,6 +228,16 @@ key_fp() {
   [[ -n "$fp" ]] && { printf '%s' "$fp"; return 0; } || return 1
 }
 
+# Derive the public key for a private-key path. Prefers the adjacent .pub file
+# (no passphrase needed); falls back to `ssh-keygen -y` (may prompt for a passphrase).
+derive_pubkey() {
+  local p; p="$(expand_tilde "$1")"
+  [[ -n "$p" ]] || return 1
+  if [[ -f "$p.pub" ]]; then cat "$p.pub"; return 0; fi
+  command -v ssh-keygen >/dev/null 2>&1 || return 1
+  ssh-keygen -y -f "$p" 2>/dev/null
+}
+
 # Validate the public-key STRING; echo its fingerprint on success.
 pubkey_check() {
   [[ -n "$1" ]] || return 2
@@ -355,6 +365,8 @@ edit_pubkey() {
   local default_pub="${SSH_KEY_PATH:+${SSH_KEY_PATH}.pub}"
   default_pub="${default_pub:-$HOME/.ssh/id_ed25519.pub}"
   local pubpath candidate
+  info "Usually unnecessary — the public key is derived from your private key (#6)."
+  info "Use this only to override (e.g. you have just a .pub, no private key)."
   ask pubpath "Path to SSH *public* key (.pub), or paste the key" "$default_pub"
   pubpath="$(expand_tilde "$pubpath")"
   if [[ "$pubpath" =~ ^(ssh-|ecdsa-) ]]; then
@@ -393,6 +405,14 @@ edit_privkey() {
     local perms; perms="$(stat -c '%a' "$p" 2>/dev/null || stat -f '%Lp' "$p" 2>/dev/null)"
     [[ -n "$perms" && "${perms: -2}" != "00" ]] \
       && warn "Permissions on $p are $perms — SSH wants owner-only. Fix: chmod 600 '$p'"
+    # Derive the public key from the private key (the thing installed into CoreOS).
+    local pub; pub="$(derive_pubkey "$p")"
+    if [[ -n "$pub" ]] && pubkey_check "$pub" >/dev/null 2>&1; then
+      SSH_PUBKEY="$pub"; ok "Public key derived from the private key."
+    else
+      warn "Couldn't derive the public key (passphrase-protected with no $p.pub?)."
+      warn "Set the public key manually via the 'SSH public key' field."
+    fi
     keys_match_warn
   else
     case $? in
@@ -451,10 +471,10 @@ edit_password() {
 }
 
 step_configure() {
-  # First run: seed the SSH key from the common default if present.
-  local default_pub="$HOME/.ssh/id_ed25519.pub"
-  [[ -z "$SSH_PUBKEY" && -f "$default_pub" ]] && SSH_PUBKEY="$(< "$default_pub")"
-  [[ -z "$SSH_KEY_PATH" && -f "$default_pub" ]] && SSH_KEY_PATH="${default_pub%.pub}"
+  # First run: seed the private key from the common default, derive the public key.
+  local default_priv="$HOME/.ssh/id_ed25519"
+  [[ -z "$SSH_KEY_PATH" && -f "$default_priv" ]] && SSH_KEY_PATH="$default_priv"
+  [[ -z "$SSH_PUBKEY" && -n "$SSH_KEY_PATH" ]] && SSH_PUBKEY="$(derive_pubkey "$SSH_KEY_PATH" 2>/dev/null)"
 
   while true; do
     banner "Settings  (saved to .env — secrets excluded)"
@@ -471,8 +491,9 @@ step_configure() {
     else rauth="password"; fi
     printf '  %s5%s) Rescue access (OVH)   : %s %svia %s%s\n' \
       "$C_BOLD" "$C_RESET" "$(shorty "$RESCUE_USER")" "$C_DIM" "$rauth" "$C_RESET"
-    printf '  %s6%s) SSH public key        : %s%s%s\n'  "$C_BOLD" "$C_RESET" "$(shorty "$SSH_PUBKEY")" "$m6" "$(keymark_pub)"
-    printf '  %s7%s) SSH private key path  : %s%s\n'    "$C_BOLD" "$C_RESET" "$(shorty "$SSH_KEY_PATH")" "$(keymark_priv)"
+    printf '  %s6%s) SSH private key       : %s%s%s\n'  "$C_BOLD" "$C_RESET" "$(shorty "$SSH_KEY_PATH")" "$m6" "$(keymark_priv)"
+    printf '  %s7%s) SSH public key        : %s %s(derived from #6)%s%s\n' "$C_BOLD" "$C_RESET" \
+                                                        "$(shorty "$SSH_PUBKEY")" "$C_DIM" "$C_RESET" "$(keymark_pub)"
     printf '  %s8%s) Console password      : %s %s(optional — for the OVH KVM console)%s\n' "$C_BOLD" "$C_RESET" \
       "$([[ -n "$PASSWORD_HASH" ]] && printf '%sset%s' "$C_GREEN" "$C_RESET" || printf '%s(not set)%s' "$C_DIM" "$C_RESET")" \
       "$C_DIM" "$C_RESET"
@@ -497,8 +518,8 @@ step_configure() {
          info "Only set a name (e.g. ens3, eth0, eno1) if you want to force one."
          ask NET_IFACE     "Network interface"                "${NET_IFACE:-auto}" ;;
       5) edit_rescue ;;
-      6) edit_pubkey ;;
-      7) edit_privkey ;;
+      6) edit_privkey ;;
+      7) edit_pubkey ;;
       8) edit_password ;;
       9) edit_stream ;;
       \?|h) settings_help ;;
@@ -522,10 +543,11 @@ ${C_BOLD}What each setting means${C_RESET}
                     authenticate: ${C_BOLD}password${C_RESET} (OVH emails a fresh one each time you
                     enable rescue) or ${C_BOLD}SSH key${C_RESET} (one you registered in OVH's rescue
                     options — may be a different key than the one you install).
-  ${C_BOLD}6 SSH public key${C_RESET}   Installed into CoreOS so you can log in. A path or pasted key.
-                    Validated with ssh-keygen (${C_GREEN}✓ valid${C_RESET}/${C_RED}⚠ invalid${C_RESET}); build is blocked if bad.
-  ${C_BOLD}7 Private key${C_RESET}      The matching private key the wizard uses to reach CoreOS later.
-                    Checked for existence + validity, and that it ${C_BOLD}matches${C_RESET} the public key.
+  ${C_BOLD}6 SSH private key${C_RESET}  The key the wizard uses to reach CoreOS. Set this and the
+                    ${C_BOLD}public key is derived automatically${C_RESET} (from its .pub or ssh-keygen -y).
+                    Checked for existence/validity + loose-permission warnings.
+  ${C_BOLD}7 SSH public key${C_RESET}   Auto-derived from #6 and installed into CoreOS. Override here
+                    only if you have just a public key. Build is blocked if invalid.
   ${C_BOLD}8 Console password${C_RESET} Optional. Lets you log in at the OVH KVM/noVNC console or a
                     maintenance prompt. Stored only as a hash, in memory — never on disk.
   ${C_BOLD}9 FCOS stream${C_RESET}      Fedora CoreOS update stream — no LTS, it auto-updates.
