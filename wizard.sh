@@ -589,14 +589,19 @@ step_inspect() {
   local names=() sizes=() models=() byids=() n s m b
   while IFS='|' read -r n s m b; do
     [[ -n "$n" ]] || continue
+    # Skip the rescue env's virtual/empty devices (nbd/loop/zram/ram/sr, 0-byte).
+    case "$n" in nbd*|loop*|zram*|ram*|sr*|fd*|dm-*) continue ;; esac
+    [[ "$s" =~ ^[0-9]+$ ]] && (( s > 0 )) || continue
     names+=("$n"); sizes+=("$s"); models+=("$m"); byids+=("$b")
   done <<< "$raw"
   local N=${#names[@]} i
+  (( N >= 1 )) || { err "No usable disks found (only virtual/empty devices)."; return 1; }
   echo; info "Disks detected:"
   for i in "${!names[@]}"; do
     printf '  %s%d%s) %-10s %9s  %s\n' "$C_BOLD" $((i+1)) "$C_RESET" \
       "${names[$i]}" "$(human_size "${sizes[$i]}")" "${models[$i]:-?}"
   done
+  info "Pick by number or device name (e.g. 1 or nvme0n1)."
   echo
 
   info "Install layout:"
@@ -607,15 +612,22 @@ step_inspect() {
   fi
   local choice; ask choice "Choose" "$([[ $N -ge 2 ]] && echo 2 || echo 1)"
 
+  # Resolve user input (a number OR a device name) to a 0-based index, or -1.
+  resolve_disk() {
+    local in="${1#/dev/}" j
+    if [[ "$in" =~ ^[0-9]+$ ]] && (( in>=1 && in<=N )); then echo $((in-1)); return; fi
+    for j in "${!names[@]}"; do [[ "${names[$j]}" == "$in" ]] && { echo "$j"; return; }; done
+    echo -1
+  }
+
   local a=-1 bi=-1 x y
   case "$choice" in
     2|3)
       (( N >= 2 )) || { err "Need at least 2 disks for RAID."; return 1; }
       if (( N == 2 )); then a=0; bi=1; else
-        ask x "First disk #" ""; ask y "Second disk #" ""
-        [[ "$x" =~ ^[0-9]+$ && "$y" =~ ^[0-9]+$ ]] && (( x>=1 && x<=N && y>=1 && y<=N && x!=y )) \
-          || { err "Invalid disk selection."; return 1; }
-        a=$((x-1)); bi=$((y-1))
+        ask x "First disk (number or name)" ""; ask y "Second disk (number or name)" ""
+        a=$(resolve_disk "$x"); bi=$(resolve_disk "$y")
+        (( a>=0 && bi>=0 && a!=bi )) || { err "Invalid disk selection."; return 1; }
       fi
       local dev_a="${byids[$a]:-/dev/${names[$a]}}" dev_b="${byids[$bi]:-/dev/${names[$bi]}}"
       INSTALL_DISK="$dev_a"; RAID_DISKS="$dev_a,$dev_b"
@@ -630,9 +642,9 @@ step_inspect() {
       ;;
     *)
       if (( N == 1 )); then a=0; else
-        ask x "Disk to install on #" ""
-        [[ "$x" =~ ^[0-9]+$ ]] && (( x>=1 && x<=N )) || { err "Invalid selection."; return 1; }
-        a=$((x-1))
+        ask x "Disk to install on (number or name)" ""
+        a=$(resolve_disk "$x")
+        (( a>=0 )) || { err "Invalid selection."; return 1; }
       fi
       DISK_LAYOUT="single"; INSTALL_DISK="${byids[$a]:-/dev/${names[$a]}}"; RAID_DISKS=""
       DISK_PLAN="single: ${names[$a]}"
